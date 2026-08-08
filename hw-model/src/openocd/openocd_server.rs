@@ -50,7 +50,7 @@ impl Drop for OpenOcdServer {
 
 impl OpenOcdServer {
     /// Duration to wait for OpenOCD to be ready to accept a Tcl connection.
-    const OPENOCD_TCL_READY_TMO: Duration = Duration::from_secs(5);
+    const OPENOCD_TCL_READY_TMO: Duration = Duration::from_secs(30);
 
     /// Wait until we see a particular message over STDERR.
     fn wait_until_regex_match<'a>(
