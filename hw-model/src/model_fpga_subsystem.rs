@@ -15,7 +15,7 @@ use crate::openocd::openocd_jtag_tap::{JtagParams, JtagTap, OpenOcdJtagTap};
 use crate::otp_provision::{
     lc_generate_memory, otp_generate_lifecycle_tokens_mem, otp_generate_linear_majority_vote,
     otp_generate_manuf_debug_unlock_token_mem, otp_generate_sw_manuf_partition_mem,
-    LifecycleControllerState, OtpSwManufPartition,
+    LifecycleControllerState, OtpSwManufPartition, LIFECYCLE_MEM_SIZE,
 };
 use crate::xi3c::XI3cError;
 use crate::{
@@ -160,7 +160,7 @@ const FLASH_SIZE: usize = 8192;
 const OTP_SIZE: usize = 8192;
 const _: () = assert!(OTP_SIZE + FLASH_SIZE == OTP_FULL_SIZE);
 const _: () = assert!(otp::OTP_CTRL_MMAP_SIZE <= OTP_SIZE);
-const _: () = assert!(otp::LIFE_CYCLE_OFFSET + 88 + 8 <= OTP_SIZE);
+const _: () = assert!(otp::LIFE_CYCLE_OFFSET + 88 * 2 + 8 <= OTP_SIZE);
 const AXI_CLK_HZ: u32 = 199_999_000;
 const I3C_CLK_HZ: u32 = 12_500_000;
 
@@ -1491,6 +1491,41 @@ impl ModelFpgaSubsystem {
         self.init_otp_with_lc_override(security_state, None)
     }
 
+    /// LCC ECC encoder: 16-bit input → 6-bit parity output.
+    pub fn pufs_oti_enc(data_i: u16) -> u8 {
+        let data = data_i as u32;
+
+        let b16 = ((data & 0x00AD5B).count_ones() & 1) as u32;
+        let b17 = ((data & 0x00366D).count_ones() & 1) as u32;
+        let b18 = ((data & 0x00C78E).count_ones() & 1) as u32;
+        let b19 = ((data & 0x0007F0).count_ones() & 1) as u32;
+        let b20 = ((data & 0x00F800).count_ones() & 1) as u32;
+
+        // The Verilog reduces bits [20:0], i.e. all 16 input bits + b16..b20.
+        let low21 = data
+            | (b16 << 16)
+            | (b17 << 17)
+            | (b18 << 18)
+            | (b19 << 19)
+            | (b20 << 20);
+        let b21 = ((low21 & 0x1FFFFF).count_ones() & 1) as u32;
+
+        ((b21 << 5) | (b20 << 4) | (b19 << 3) | (b18 << 2) | (b17 << 1) | b16) as u8
+    }
+
+    pub fn lc_generate_ecc_memory(mem: &[u8]) -> Result<[u8; LIFECYCLE_MEM_SIZE * 2]> {
+        let mut result = [0u8; LIFECYCLE_MEM_SIZE * 2];
+        for i in (0..LIFECYCLE_MEM_SIZE).step_by(2) {
+            let data_u16: u16 = (mem[i + 0] as u16) | ((mem[i + 1] as u16) << 8);
+            result[2 * i + 0] = mem[i + 0];
+            result[2 * i + 1] = mem[i + 1];
+            result[2 * i + 2] = Self::pufs_oti_enc(data_u16);
+            result[2 * i + 3] = 0;
+        }
+
+        Ok(result)
+    }
+
     pub fn init_otp_with_lc_override(
         &self,
         security_state: Option<&SecurityState>,
@@ -1527,8 +1562,9 @@ impl ModelFpgaSubsystem {
         if let Some(lc_state) = lc_state {
             println!("Provisioning lifecycle partition (State: {}).", lc_state);
             let mem = lc_generate_memory(lc_state, 1)?;
+            let eccmem = Self::lc_generate_ecc_memory(&mem)?;
             let offset = otp::LIFE_CYCLE_OFFSET;
-            otp_data[offset..offset + mem.len()].copy_from_slice(&mem);
+            otp_data[offset..offset + eccmem.len()].copy_from_slice(&eccmem);
         }
 
         // Provision OTP based on target_provisioning_stage
