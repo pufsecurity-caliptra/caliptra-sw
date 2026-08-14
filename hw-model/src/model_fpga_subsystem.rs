@@ -1526,6 +1526,15 @@ impl ModelFpgaSubsystem {
         Ok(result)
     }
 
+    pub fn check_otp_reset(now: &[u8], new: &[u8]) -> bool {
+        assert_eq!(now.len(), new.len(), "check_otp_reset: OTP data length mismatch");
+
+        let reset = now.iter().zip(new.iter()).any(|(&o, &e)| o & !e != 0);
+        assert!(!reset, "PUFrt: detected OTP write with reset");
+
+        reset
+    }
+
     pub fn init_otp_with_lc_override(
         &self,
         security_state: Option<&SecurityState>,
@@ -1733,6 +1742,9 @@ impl ModelFpgaSubsystem {
             otp_data[otp::CPTRA_CORE_SOC_MANIFEST_MAX_SVN_OFFSET] = self.fuses.soc_manifest_max_svn;
         }
 
+        // illegal otp reset check
+        let now = self.otp_slice().to_vec();
+        Self::check_otp_reset(&now, &otp_data);
         self.otp_slice().copy_from_slice(&otp_data);
 
         Ok(())
