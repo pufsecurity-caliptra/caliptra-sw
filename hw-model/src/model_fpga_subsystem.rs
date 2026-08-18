@@ -50,6 +50,7 @@ const MCU_ROM_MAPPING: (usize, usize) = (1, 1);
 const I3C_TARGET_MAPPING: (usize, usize) = (1, 2);
 const MCI_MAPPING: (usize, usize) = (1, 3);
 const OTP_MAPPING: (usize, usize) = (1, 4);
+const PUFRT_BRAM_MAPPING: (usize, usize) = (2, 0);
 
 // Default flash size: 16MB each, initialized to 0xFF
 const DEFAULT_FLASH_SIZE: usize = 16 * 1024 * 1024;
@@ -158,6 +159,8 @@ const DEFAULT_AXI_PAUSER: u32 = 0x1;
 const OTP_FULL_SIZE: usize = 16384;
 const FLASH_SIZE: usize = 8192;
 const OTP_SIZE: usize = 8192;
+const PUFRT_PUF_BRAM_SIZE: usize = 1024;
+const PUFRT_OTP_BRAM_SIZE: usize = 32768;
 const _: () = assert!(OTP_SIZE + FLASH_SIZE == OTP_FULL_SIZE);
 const _: () = assert!(otp::OTP_CTRL_MMAP_SIZE <= OTP_SIZE);
 const _: () = assert!(otp::LIFE_CYCLE_OFFSET + 88 * 2 + 8 <= OTP_SIZE);
@@ -390,11 +393,12 @@ impl XI3CWrapper {
 }
 
 pub struct ModelFpgaSubsystem {
-    pub devs: [UioDevice; 2],
+    pub devs: [UioDevice; 3],
     pub wrapper: Arc<Wrapper>,
     pub caliptra_rom_backdoor: *mut u8,
     pub mcu_rom_backdoor: *mut u8,
     pub otp_mem_backdoor: *mut u8,
+    pub pufrt_bram_backdoor: *mut u8,
     // Reset sensitive MMIO UIO pointers. Accessing these while subsystem is in reset will trigger
     // a kernel panic.
     pub mmio: SensitiveMmio,
@@ -557,6 +561,8 @@ impl ModelFpgaSubsystem {
         println!("Putting subsystem into reset");
         self.set_subsystem_reset(true);
 
+        // Use PUFrt Block RAM backdoor to reset OTP
+        self.reset_pufrt_otp_bram();
         // Declaring this vec! gets LLVM to emit a memcpy. Otherwise, writes
         // to the FPGA block RAM fail with a SIGBUS fault.
         let zeroed_otp = vec![0u8; OTP_SIZE];
@@ -1754,6 +1760,15 @@ impl ModelFpgaSubsystem {
         unsafe { core::slice::from_raw_parts_mut(self.otp_mem_backdoor, OTP_SIZE) }
     }
 
+    pub fn pufrt_otp_bram_slice(&self) -> &mut [u8] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.pufrt_bram_backdoor.offset(PUFRT_PUF_BRAM_SIZE as isize),
+                PUFRT_OTP_BRAM_SIZE,
+            )
+        }
+    }
+
     /// Override the lifecycle controller state that will be provisioned into
     /// OTP on the next `cold_reset()`. Useful for tests that perform JTAG
     /// lifecycle transitions and need the new state to survive a cold reset.
@@ -1780,12 +1795,27 @@ impl ModelFpgaSubsystem {
     }
 
     pub fn print_otp_memory(&self) {
-        let otp = self.otp_slice();
+        let otp = self.otp_slice().to_vec();
         for (i, oi) in otp.iter().copied().enumerate() {
             if oi != 0 {
                 println!("OTP mem: {:03x}: {:02x}", i, oi);
             }
         }
+    }
+
+    pub fn print_pufrt_otp_bram(&self) {
+        let (prefix, bram, postfix) = unsafe { self.pufrt_otp_bram_slice().align_to_mut::<u64>() };
+        for (i, oi) in bram.iter().copied().enumerate() {
+            if oi != 0x0000007fffffffff {
+                println!("PUFrt block RAM: {:04x}: {:016x}", i, oi);
+            }
+        }
+    }
+
+    pub fn reset_pufrt_otp_bram(&self) {
+        const RESET_PUFRT_OTP_BRAM_WORD: [u8; 8] = [ 0xff, 0xff, 0xff, 0xff, 0x7f, 0, 0, 0 ];
+        let zeroed_otp_bram: Vec<u8> = RESET_PUFRT_OTP_BRAM_WORD.repeat(PUFRT_OTP_BRAM_SIZE / 8);
+        self.pufrt_otp_bram_slice().copy_from_slice(&zeroed_otp_bram);
     }
 
     pub fn mci_flow_status(&mut self) -> u32 {
@@ -1880,7 +1910,8 @@ impl HwModel for ModelFpgaSubsystem {
         let output = Output::new(params.log_writer);
         let dev0 = UioDevice::blocking_new(0)?;
         let dev1 = UioDevice::blocking_new(1)?;
-        let devs = [dev0, dev1];
+        let dev2 = UioDevice::blocking_new(2)?;
+        let devs = [dev0, dev1, dev2];
 
         let wrapper = Arc::new(Wrapper {
             ptr: devs[FPGA_WRAPPER_MAPPING.0]
@@ -1895,6 +1926,9 @@ impl HwModel for ModelFpgaSubsystem {
             .map_err(fmt_uio_error)?;
         let otp_mem_backdoor = devs[OTP_RAM_MAPPING.0]
             .map_mapping(OTP_RAM_MAPPING.1)
+            .map_err(fmt_uio_error)? as *mut u8;
+        let pufrt_bram_backdoor = devs[PUFRT_BRAM_MAPPING.0]
+            .map_mapping(PUFRT_BRAM_MAPPING.1)
             .map_err(fmt_uio_error)? as *mut u8;
         let mcu_rom_backdoor = devs[MCU_ROM_MAPPING.0]
             .map_mapping(MCU_ROM_MAPPING.1)
@@ -1963,6 +1997,7 @@ impl HwModel for ModelFpgaSubsystem {
             caliptra_rom_backdoor,
             mcu_rom_backdoor,
             otp_mem_backdoor,
+            pufrt_bram_backdoor,
             mmio: SensitiveMmio::new(SensitiveMmioArgs {
                 caliptra_mmio,
                 mci: Mci { ptr: mci_ptr },
@@ -2778,6 +2813,7 @@ impl Drop for ModelFpgaSubsystem {
         self.unmap_mapping(self.caliptra_rom_backdoor as *mut u32, CALIPTRA_ROM_MAPPING);
         self.unmap_mapping(self.mcu_rom_backdoor as *mut u32, MCU_ROM_MAPPING);
         self.unmap_mapping(self.otp_mem_backdoor as *mut u32, OTP_RAM_MAPPING);
+        self.unmap_mapping(self.pufrt_bram_backdoor as *mut u32, PUFRT_BRAM_MAPPING);
         self.mmio.unmap(self);
     }
 }
